@@ -8,6 +8,7 @@
     "scheme": "testexpo",
     "userInterfaceStyle": "automatic",
     "ios": {
+      "bundleIdentifier": "com.jcodog.expo58smoke",
       "icon": "./assets/expo.icon"
     },
     "android": {
