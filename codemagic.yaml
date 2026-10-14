@@ -1,14 +1,13 @@
-# Copy this file to codemagic.yaml at the root of jcodog/expo58-ios-smoke.
-# No automatic triggers: run builds manually in Codemagic to conserve free minutes.
-# Produces an UNSIGNED iPhone-device IPA for experimental installation with Sideloadly.
-# It does not deploy to TestFlight or use Expo EAS Build credits.
+# Expo SDK 58 iOS smoke build.
+# Manual Codemagic run; no Apple signing or EAS Build credits required to COMPILE.
+# A compiled unsigned IPA still requires separate device signing/install testing.
 workflows:
   expo58-unsigned-iphone:
     name: Expo SDK 58 - unsigned iPhone IPA
     instance_type: mac_mini_m2
     max_build_duration: 90
     environment:
-      xcode: edge # Currently Xcode 27.2; check Codemagic's machine image at build time
+      xcode: edge
       node: 24
       cocoapods: default
       vars:
@@ -21,33 +20,48 @@ workflows:
           xcodebuild -version
           node --version
           npm --version
+
       - name: Install pinned Bun and project dependencies
         script: |
           npm install --global bun@1.3.14
           bun --version
           bun install --frozen-lockfile
           node -e 'const v=require("expo/package.json").version; console.log("Expo SDK package:",v); if (!v.startsWith("58.")) process.exit(1)'
+
       - name: Generate native iOS project without signing
         script: |
           bunx expo prebuild --platform ios --clean --no-install
+
       - name: Install CocoaPods
         script: |
           cd ios
           pod install
+
       - name: Build unsigned app for physical iPhone
         script: |
           #!/usr/bin/env bash
           set -euo pipefail
-          WORKSPACE=$(find ios -maxdepth 1 -name '*.xcworkspace' -type d -print -quit)
-          if [[ -z "$WORKSPACE" ]]; then
-            echo 'No Xcode workspace was generated'; exit 1
+          cd "$CM_BUILD_DIR"
+          WORKSPACE=$(find ios -maxdepth 1 -type d -name '*.xcworkspace' -print -quit)
+          PROJECT=$(find ios -maxdepth 1 -type d -name '*.xcodeproj' -print -quit)
+          if [[ -z "$WORKSPACE" || -z "$PROJECT" ]]; then
+            echo 'Expected iOS Xcode workspace and project were not generated.' >&2
+            find ios -maxdepth 2 \( -name '*.xcworkspace' -o -name '*.xcodeproj' \) -print
+            exit 1
           fi
-          SCHEME=$(xcodebuild -list -json -workspace "$WORKSPACE" | python3 -c 'import sys,json; print(json.load(sys.stdin)["workspace"]["schemes"][0])')
-          echo "Building workspace=$WORKSPACE scheme=$SCHEME"
+
+          # IMPORTANT: Do not select workspace.schemes[0]. CocoaPods/Expo can
+          # expose library schemes which build successfully but produce NO .app.
+          APP_SCHEME=$(basename "$PROJECT" .xcodeproj)
+          echo "Workspace: $WORKSPACE"
+          echo "App project: $PROJECT"
+          echo "App scheme candidate: $APP_SCHEME"
+          xcodebuild -list -workspace "$WORKSPACE"
+
           mkdir -p build
           xcodebuild \
             -workspace "$WORKSPACE" \
-            -scheme "$SCHEME" \
+            -scheme "$APP_SCHEME" \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -55,20 +69,33 @@ workflows:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' \
-            build 2>&1 | tee build/xcodebuild.log
+            build 2>&1 | tee "$CM_BUILD_DIR/build/xcodebuild.log"
+
+          PRODUCTS="$CM_BUILD_DIR/build/DerivedData/Build/Products/Release-iphoneos"
+          echo 'Built product directories:'
+          find "$CM_BUILD_DIR/build/DerivedData/Build/Products" -maxdepth 3 -name '*.app' -type d -print || true
+          if ! find "$PRODUCTS" -maxdepth 1 -name '*.app' -type d -print -quit | grep -q .; then
+            echo "Xcode completed but no iPhone .app was found at $PRODUCTS" >&2
+            echo 'Inspect selected Xcode scheme and build/xcodebuild.log.' >&2
+            exit 1
+          fi
+
       - name: Package unsigned IPA
         script: |
           #!/usr/bin/env bash
           set -euo pipefail
+          cd "$CM_BUILD_DIR"
           PRODUCTS="$CM_BUILD_DIR/build/DerivedData/Build/Products/Release-iphoneos"
-          APP=$(find "$PRODUCTS" -maxdepth 1 -type d -name '*.app' -print -quit)
+          APP=$(find "$PRODUCTS" -maxdepth 1 -name '*.app' -type d -print -quit)
           if [[ -z "$APP" ]]; then
-            echo 'No iPhone .app bundle was produced'; exit 1
+            echo "No iPhone .app bundle found at $PRODUCTS" >&2
+            exit 1
           fi
           mkdir -p dist/Payload
           ditto "$APP" "dist/Payload/$(basename "$APP")"
           (cd dist && zip -qry Expo58Smoke-unsigned.ipa Payload)
           ls -lh dist/Expo58Smoke-unsigned.ipa
+
     artifacts:
       - dist/*.ipa
       - build/xcodebuild.log
